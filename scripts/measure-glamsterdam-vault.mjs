@@ -32,7 +32,7 @@ import { GLAMSTERDAM as G, ZERO_BYTES32, artifact, bigintEnv, freshSwapId, mainn
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const EXPLORER = G.explorer;
-const REPORT = "glamsterdam-vault";
+const REPORT = process.env.GLAMSTERDAM_REPORT_NAME ?? "glamsterdam-vault"; // e.g. local-vault for the glamsterdam-local node
 
 if (process.argv[2] === "render") {
   const rep = JSON.parse(await readFile(reportPath(`${REPORT}.json`), "utf8"));
@@ -43,7 +43,7 @@ if (process.argv[2] === "render") {
 
 // ------------------------------------------------------------------ parameters
 const AMOUNT = parseUnits(process.env.AMOUNT_USDT ?? "10", 6);
-const TTL_SHORT = bigintEnv("RESERVATION_TTL_SECONDS", 90n); // shapes C and E: expire soon (counted from the lock itself)
+const TTL_SHORT = bigintEnv("RESERVATION_TTL_SECONDS", 600n); // shapes C and E: expire soon (counted from the lock itself; a broadcast can sit minutes on the public RPC)
 const TTL_LONG = bigintEnv("RESERVATION_TTL_LONG_SECONDS", 7200n); // shapes A, B, D: claimed in the round; a round of ten locks took 30 min on the public RPC
 const MAINNET_USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 const USDT = getAddress(process.env.GLAMSTERDAM_USDT_COPY_ADDRESS ?? "0xc621dfb139d34c63b50d10f6417134e69e482864");
@@ -154,7 +154,7 @@ async function estimateGas(signer, req) {
   return 600_000n;
 }
 const call = (what, { address, abi, functionName, args, value, signer, gas }) => sendTx(what, { to: address, data: encodeFunctionData({ abi, functionName, args }), ...(value ? { value } : {}), ...(gas ? { gas } : {}) }, signer);
-const tx = (h) => `${EXPLORER}/tx/${h}`;
+const tx = (h) => (EXPLORER ? `${EXPLORER}/tx/${h}` : `\`${h}\``);
 const freshKey = () => { const k = generatePrivateKey(); return { key: k, account: privateKeyToAccount(k) }; };
 const balanceBefore = (who, blockNumber) => readT("balanceOf", [who], blockNumber - 1n).catch(() => null);
 async function waitPastTimestamp(ts) {
@@ -403,7 +403,7 @@ if (errors.length) process.exit(1);
 
 // ------------------------------------------------------------------ markdown
 function renderMd(rep) {
-  const short = (h) => `[\`${h.slice(0, 10)}…\`](${rep.explorer}/tx/${h})`;
+  const short = (h) => (rep.explorer ? `[\`${h.slice(0, 10)}…\`](${rep.explorer}/tx/${h})` : `\`${h.slice(0, 10)}…\``);
   const addr = (a) => `[\`${a}\`](${rep.explorer}/address/${a})`;
   const blk = (n) => `[${n}](${rep.explorer}/block/${n})`;
   const fmt = (n) => (n === null || n === undefined ? "–" : Number(n).toLocaleString("en-US"));
@@ -412,7 +412,10 @@ function renderMd(rep) {
   const d = (a, b) => (a && b ? fmt(n(a.gasUsed) - n(b.gasUsed)) : "–");
   const L = [];
   L.push("# Bridge vault with a reservation ring under Glamsterdam gas rules: devnet receipts", "");
-  L.push(`Measured ${rep.ranAt.slice(0, 10)} (${rep.ranAt}) on the public Glamsterdam devnet **Platåberget** (chainId ${rep.chainId}; the public RPC load-balances over several execution clients, the one that answered \`web3_clientVersion\` at start was \`${rep.clientVersion ?? "unknown"}\`; basefee ${rep.blockAtStart.baseFeePerGas} wei, block gas limit ${fmt(rep.blockAtStart.gasLimit)}), explorer [dora](${rep.explorer}). Script: \`npm run measure:glam\` (\`scripts/measure-glamsterdam-vault.mjs\`); machine-readable evidence: \`reports/${REPORT}.json\`.`, "");
+  const where = rep.explorer
+    ? `on the public Glamsterdam devnet **Platåberget** (chainId ${rep.chainId}; the public RPC load-balances over several execution clients, the one that answered \`web3_clientVersion\` at start was \`${rep.clientVersion ?? "unknown"}\`; basefee ${rep.blockAtStart.baseFeePerGas} wei, block gas limit ${fmt(rep.blockAtStart.gasLimit)}), explorer [dora](${rep.explorer})`
+    : `on a **local go-ethereum node with Amsterdam active from genesis** (the \`glamsterdam-local\` repo; chainId ${rep.chainId}, client \`${rep.clientVersion ?? "unknown"}\`; basefee ${rep.blockAtStart.baseFeePerGas} wei, block gas limit ${fmt(rep.blockAtStart.gasLimit)}); no explorer, transaction hashes are shown as is`;
+  L.push(`Measured ${rep.ranAt.slice(0, 10)} (${rep.ranAt}) ${where}. Script: \`npm run measure:glam\` (\`scripts/measure-glamsterdam-vault.mjs\`); machine-readable evidence: \`reports/${REPORT}.json\`.`, "");
   L.push(`Two vaults, same run, same token, same owner ${addr(rep.actor)}: the **legacy** \`MuunUSDTVault\` of bridge-vault (${rep.vaults.legacy.source}, ${rep.vaults.legacy.runtimeBytes} runtime bytes, one fresh \`reservations[swapId]\` slot per swap, deleted on claim) at ${addr(rep.vaults.legacy.address)}, and the **ring** \`MuunRingVault\` (${rep.vaults.ring.source}, ${rep.vaults.ring.runtimeBytes} runtime bytes, \`bytes32[2**32] ring\`, an index per reservation, overwritten with \`CONSUMED\` on claim and rewritten by the next lock) at ${addr(rep.vaults.ring.address)}. Both sit on the byte-exact mainnet USDT copy ${addr(rep.token)}, use EntryPoint v0.9 ${addr(rep.entryPoint)} and the \`Simple7702Account\` delegate ${addr(rep.accountImplementation)} already on the devnet, and reserve ${Number(rep.amount) / 1e6} USDT per swap. Round **first** uses ring indices ${rep.ringIndexBase ?? 0}..${(rep.ringIndexBase ?? 0) + 4} for the first time (the fresh-slot premium is in it); round **reuse** rewrites them (the steady state). "Cold" = the recipient had never held the token; "warm" = it already did. Every gas figure below is a receipt's \`gasUsed\`; nothing is an estimate.`, "");
 
   L.push("## Result: legacy vault against ring vault, step by step", "");

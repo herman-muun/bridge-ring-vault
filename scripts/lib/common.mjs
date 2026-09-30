@@ -12,16 +12,22 @@ loadEnv({ path: resolve(".env"), quiet: true });
 export const ZERO_BYTES32 = `0x${"00".repeat(32)}`;
 
 /// Glamsterdam devnet "plataberget" (EIP-8037 / EIP-8038 gas rules). Public RPC as fallback.
+/// GLAMSTERDAM_CHAIN_ID selects another chain with the same rules, e.g. the local geth 1.17.6
+/// node of the glamsterdam-local repo (chain 70910475), which has no explorer.
+const CHAIN_ID = Number(process.env.GLAMSTERDAM_CHAIN_ID ?? 7_091_047_534);
+const LOCAL = CHAIN_ID !== 7_091_047_534;
+const RPC_URL = process.env.GLAMSTERDAM_RPC_URL ?? (LOCAL ? "http://127.0.0.1:8545" : "https://rpc.plataberget.ethpandaops.io");
 export const GLAMSTERDAM = {
   chain: {
-    id: 7_091_047_534,
-    name: "Glamsterdam devnet (plataberget)",
+    id: CHAIN_ID,
+    name: LOCAL ? `local Glamsterdam node (chain ${CHAIN_ID})` : "Glamsterdam devnet (plataberget)",
     nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-    rpcUrls: { default: { http: [process.env.GLAMSTERDAM_RPC_URL ?? "https://rpc.plataberget.ethpandaops.io"] } },
+    rpcUrls: { default: { http: [RPC_URL] } },
   },
-  rpcUrl: process.env.GLAMSTERDAM_RPC_URL ?? "https://rpc.plataberget.ethpandaops.io",
-  explorer: "https://dora.plataberget.ethpandaops.io",
-  label: "Glamsterdam devnet (plataberget)",
+  rpcUrl: RPC_URL,
+  explorer: LOCAL ? null : "https://dora.plataberget.ethpandaops.io",
+  label: LOCAL ? `local geth node with Amsterdam active (glamsterdam-local, chain ${CHAIN_ID})` : "Glamsterdam devnet (plataberget)",
+  local: LOCAL,
 };
 
 export function requiredEnv(name) {
