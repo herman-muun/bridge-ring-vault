@@ -1,0 +1,26 @@
+[profile.default]
+src = "contracts"
+script = "script"
+out = "out"
+cache_path = "cache"
+solc_version = "0.8.28"
+evm_version = "prague"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+cbor_metadata = false
+fs_permissions = [
+  { access = "read", path = "./out" },
+  { access = "read-write", path = "./reports" }
+]
+
+[rpc_endpoints]
+glamsterdam = "${GLAMSTERDAM_RPC_URL}"
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"

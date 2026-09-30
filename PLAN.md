@@ -1,5 +1,10 @@
 # bridge-ring-vault: plan
 
+Status 2026-09-30: sections 1 to 4 done (contract, 74 tests, runner, receipts). The devnet run
+of 2026-09-29 measured every step at least once and the locks of both rounds; its reuse-round
+claims did not repeat because the public RPC went down (details in
+`reports/glamsterdam-vault.md`, "What did not run"). Numbers in `docs/design.md` §4.
+
 The Ethereum bridge vault of `bridge-vault` (`MuunUSDTVault`, lock / claimBySig / sponsored
 claimSelf) rewritten so that reservations live in a ring of reusable storage slots, the way
 `storage-proof-ring-swap` did for `Fulfillment.ring`. Goal: measure on the Glamsterdam devnet
@@ -12,10 +17,11 @@ re-measured in the same run as the baseline.
   reservation is written into the index Muun picks. The slot is never zeroed again: `claim` and
   `refund` overwrite it with a non-zero `CONSUMED` marker, and `lock` may rewrite an index whose
   reservation expired or was consumed.
-- What we expect [ESTIMATE]: `lock` drops by about the fresh-slot premium measured on the ring
-  repo (97,920 gas, 2026-09-28 receipts), from 157,208 to roughly 59,000 in steady state.
-  `claimBySig` may rise by up to 4,800 gas because it no longer earns the clearing refund. The
-  run decides; nothing here is a measurement.
+- What we expected [ESTIMATE, written before the run]: `lock` drops by about the fresh-slot
+  premium measured on the ring repo (97,920 gas, 2026-09-28 receipts), from 157,208 to roughly
+  59,000 in steady state; `claimBySig` rises by up to 4,800 gas for the lost clearing refund.
+  Measured: `lock` 159,692 to 62,504 (−97,188); `claimBySig` +12,108, more than the refund
+  alone.
 - How we check it: one script, `npm run measure:glam`, deploys the old vault and the ring vault
   on the byte-exact mainnet USDT copy already on the devnet, runs the same steps against both
   (round `first`, wait for expiry, round `reuse`), and writes `reports/glamsterdam-vault.{json,md}`.

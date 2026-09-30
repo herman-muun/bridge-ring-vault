@@ -1,0 +1,24 @@
+{
+  "name": "bridge-ring-vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Muun prefunded USDT bridge vault with reservations in a ring of reusable storage slots, measured under Glamsterdam gas rules against the mapping-based vault.",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "lint": "forge lint",
+    "measure:glam": "forge build && node scripts/measure-glamsterdam-vault.mjs",
+    "render:glam": "node scripts/measure-glamsterdam-vault.mjs render"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@openzeppelin/contracts": "5.4.0",
+    "account-abstraction": "github:eth-infinitism/account-abstraction#v0.9.0",
+    "dotenv": "17.2.1",
+    "viem": "2.33.3"
+  },
+  "devDependencies": {
+    "forge-std": "github:foundry-rs/forge-std#v1.10.0"
+  }
+}
