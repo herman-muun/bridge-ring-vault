@@ -1,5 +1,97 @@
 # bridge-ring-vault: plan
 
+## Hardening pass (plan, 2026-10-02)
+
+Status: plan. Source: `hardening-exploration/REPORT.md` §1.4 (E1, E5b, E9), §2.3, §2.6, and
+`research/ring-entry-comparison.md`. Decisions taken by Herman on 2026-10-01 and 2026-10-02.
+The claim tip (`bridge-vault/LAST_LEG.md`, "Possible improvement") stays out of this pass.
+
+### TL;DR
+
+- A reservation never expires. `expiry`, `refund`, rule R2 and `Released` go; a slot is consumed
+  only by `claimSelf` or `claimBySig`, and `lock` accepts an index only when it holds `0` or
+  `CONSUMED`. An abandoned reservation stays for ever, as if the USDT had been sent to `P`; the
+  pinned liquidity and exit budget are Muun's cost.
+- With nothing to read inline, the entry is the full 256-bit `keccak(swapId, claimant, amount)`:
+  birthday 2^128 instead of 2^80, second preimage 2^256.
+- `lock` requires the EntryPoint stake to satisfy the bundlers, not only `staked == true`:
+  `stake >= MIN_STAKE` and `unstakeDelaySec >= MIN_UNSTAKE_DELAY`, both immutables.
+- Not in this pass: the claim tip, any change to the paymaster shapes beyond dropping `expiry`,
+  anything on the Base path.
+
+```mermaid
+flowchart LR
+  Z["ring[idx] = 0, never used"] -->|"lock, fresh-slot premium once"| L["live: keccak(swapId, claimant, amount)"]
+  C["CONSUMED = 1"] -->|"lock, warm rewrite"| L
+  L -->|"claimSelf or claimBySig"| C
+  L -->|"user never comes back"| L
+```
+
+### 1. Contract changes (`contracts/MuunRingVault.sol`)
+
+- What the table shows: each element of the contract as it is and what the pass does to it.
+
+| element | today | after the pass |
+| --- | --- | --- |
+| entry layout | `hash160 ‖ amount64 ‖ expiry32` | `keccak256(abi.encode(swapId, claimant, amount))`, 256 bits; `ENTRY_*_SHIFT/MASK` removed |
+| `lock(swapId, claimant, amount, expiry, idx)` | reverts `SlotLive` while `expiry >= now`; releases an expired entry inline (R2) | `lock(swapId, claimant, amount, idx)`: reverts `SlotLive(idx)` unless `ring[idx]` is `0` or `CONSUMED`; no inline release |
+| `amount` bound | `uint64` (entry field) | `uint128` (the `reserved` counter); `ZeroAmount` and `ValueOverflow` as today |
+| `claimSelf`, `claimBySig` | take `expiry`, revert `ReservationExpired` | drop `expiry`; no time check |
+| `refund`, `Refunded`, `Released`, `InvalidExpiry`, `ReservationExpired`, `ReservationNotExpired` | present | removed |
+| `isReservation`, `entry` | with `expiry` | `(swapId, claimant, amount[, idx])` |
+| `Locked`, `Redeemed` | `Locked` carries `expiry` | `Locked(swapId, claimant, amount, idx)`; `Redeemed` unchanged |
+| EIP-712 `Claim` | `Claim(bytes32 swapId,uint256 amount,address recipient,uint48 expiry)`, domain version "2" | `Claim(bytes32 swapId,uint256 amount,address recipient)`, domain version "3" |
+| paymaster `_screen` | calldata 324 B, inner 164 B, five words, returns `validUntil = expiry` | calldata 292 B, inner 132 B, four words (`swapId, amount, recipient, idx`), `validUntil = 0` |
+| stake check in `lock` | `info.staked` | plus `info.stake >= MIN_STAKE` (`StakeTooLow`) and `info.unstakeDelaySec >= MIN_UNSTAKE_DELAY` (`UnstakeDelayTooShort`) |
+| `Config` | ten fields | plus `minStake`, `minUnstakeDelaySec`; constructor rejects zero for either |
+| header rules | R1 to R6 | R1 rewritten (256-bit entry, free means `0` or `CONSUMED`), R2 replaced by "no expiry, no refund", R3 to R6 kept, R7 "stake minimums" |
+
+What does not change: `bytes32[2**32] ring`, `CONSUMED`, `_reserves` packing, deposit and
+withdraw gating, ETH and stake functions, gas caps, the delegate check, `sponsorshipRejection`.
+
+### 2. Tests (`test/unit/`)
+
+- What the table shows: per file, what is removed and what is added.
+
+| file | remove | add |
+| --- | --- | --- |
+| `Ring.t.sol` | R2 (inline release), every `warp` past expiry, `refund` cases | R1: `lock` over a live entry reverts whatever the time; R2': a reservation is claimable after a `warp` of years; R7: entry equals the raw keccak and no 64-bit truncation of `amount` matches another amount |
+| `PaymasterValidation.t.sol` | the `expiry` word tests | the 292-byte shape; the old 324-byte shape is `REJECT_CALLDATA`; `validationData` carries no `validUntil` |
+| `SponsorshipFunding.t.sol` | `addStake(1)` as a valid setup | `lock` reverts `StakeTooLow` and `UnstakeDelayTooShort`; the floor values pass |
+| `Invariant.t.sol` | the expired-entry term | `reserved == sum of unconsumed entries`, `inFlight == count of unconsumed entries`, for ever |
+| `RecoveryE2E.t.sol` | `expiry` plumbing | unchanged scenarios: sponsored exit to a recipient that is not `P`, one burned attempt bounded, nonce 1 declined |
+| `VaultTestBase.sol` | | `Config` with `minStake` 1 ether and `minUnstakeDelaySec` 1 day, matching the fixtures |
+
+### 3. Measurement and docs
+
+1. `scripts/measure-glamsterdam-vault.mjs` and `scripts/lib/userop.mjs`: drop `expiry` from
+   the calls and the userOp, drop the "wait for expiry" and the `refund` step, keep the two
+   rounds (`first`, `reuse`) with the reuse round driven by claims only.
+2. Run against the local Glamsterdam node (`glamsterdam-local`, chain id 70910475) and write
+   `reports/local-vault-2026-10.{json,md}` next to the existing reports. Expected `[ESTIMATE]`:
+   `lock` within a few hundred gas of today's 62,504 on reuse (one fewer range check, one more
+   comparison on the stake), `claimBySig` unchanged.
+3. `docs/decisions.md`: #7 no expiry and no refund (2026-10-01), #8 256-bit entry, #9 stake
+   minimums, #10 claim tip deferred; mark #2 and #4 as replaced. `docs/design.md` §1 to §3 and
+   `README.md` updated after the receipts. `hardening-exploration/REPORT.md` §2.3 and §2.6 move
+   from "decided" to "implemented".
+
+### 4. Order of work
+
+1. Contract (section 1), `forge build`.
+2. Tests (section 2), `forge test`.
+3. Scripts, local run, reports (section 3).
+4. Docs. Herman commits.
+
+### 5. Values to confirm before any deployment
+
+- What the table shows: the two new immutables, the suggested values and what settles them.
+
+| immutable | suggested | settles it |
+| --- | --- | --- |
+| `MIN_STAKE` | 1 ether on Ethereum `[ESTIMATE]` | ERC-7562 `MIN_STAKE_VALUE` ("roughly $1000"); ask Pimlico and Candide for their mainnet value |
+| `MIN_UNSTAKE_DELAY` | 86,400 s | ERC-7562 `MIN_UNSTAKE_DELAY` |
+
 Status 2026-09-30: sections 1 to 4 done (contract, 74 tests, runner, receipts). The devnet run
 of 2026-09-29 measured every step at least once and the locks of both rounds; its reuse-round
 claims did not repeat because the public RPC went down (details in
