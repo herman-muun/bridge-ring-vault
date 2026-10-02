@@ -38,7 +38,8 @@ flowchart LR
 | `amount` bound | `uint64` (entry field) | `uint128` (the `reserved` counter); `ZeroAmount` and `ValueOverflow` as today |
 | `claimSelf`, `claimBySig` | take `expiry`, revert `ReservationExpired` | drop `expiry`; no time check |
 | `refund`, `Refunded`, `Released`, `InvalidExpiry`, `ReservationExpired`, `ReservationNotExpired` | present | removed |
-| `isReservation`, `entry` | with `expiry` | `(swapId, claimant, amount[, idx])` |
+| `entry` | `entry(swapId, claimant, amount, expiry)` | `entry(swapId, claimant, amount)` |
+| `isReservation` | `isReservation(swapId, claimant, amount, expiry, idx)` | `isReservation(swapId, claimant, amount, idx)` |
 | `Locked`, `Redeemed` | `Locked` carries `expiry` | `Locked(swapId, claimant, amount, idx)`; `Redeemed` unchanged |
 | EIP-712 `Claim` | `Claim(bytes32 swapId,uint256 amount,address recipient,uint48 expiry)`, domain version "2" | `Claim(bytes32 swapId,uint256 amount,address recipient)`, domain version "3" |
 | paymaster `_screen` | calldata 324 B, inner 164 B, five words, returns `validUntil = expiry` | calldata 292 B, inner 132 B, four words (`swapId, amount, recipient, idx`), `validUntil = 0` |
