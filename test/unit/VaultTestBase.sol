@@ -25,6 +25,8 @@ abstract contract VaultTestBase is Test {
     uint256 internal constant MAX_FEE = 50 gwei;
     uint256 internal constant PRIORITY_CAP = 2 gwei;
     uint256 internal constant COST = ENVELOPE * MAX_FEE;
+    uint256 internal constant MIN_STAKE = 1 ether;
+    uint32 internal constant MIN_UNSTAKE_DELAY = 1 days;
 
     uint256 internal constant VAULT_USDT = 1_000_000e6;
     uint256 internal constant AMOUNT = 10e6;
@@ -49,7 +51,20 @@ abstract contract VaultTestBase is Test {
         accountImpl = new Simple7702Account(IEntryPoint(address(entryPoint)));
         token = new MockUSDT();
 
-        MuunRingVault.Config memory c;
+        vault = _deployVault();
+
+        vm.deal(owner, 100 ether);
+        vm.deal(bundler, 100 ether);
+        vm.warp(1_800_000_000);
+
+        _fundDeposit(10 * COST);
+        vm.prank(owner);
+        vault.addStake{ value: MIN_STAKE }(MIN_UNSTAKE_DELAY);
+    }
+
+    // --- helpers ---------------------------------------------------------------------------
+
+    function _config() internal view returns (MuunRingVault.Config memory c) {
         c.token = address(token);
         c.owner = owner;
         c.entryPoint = IEntryPoint(address(entryPoint));
@@ -60,20 +75,15 @@ abstract contract VaultTestBase is Test {
         c.callGasLimitCap = CGL_CAP;
         c.paymasterVerificationGasLimitCap = PMV_CAP;
         c.maxPriorityFeePerGasCap = PRIORITY_CAP;
-        vault = new MuunRingVault(c);
-
-        token.mint(address(vault), VAULT_USDT);
-
-        vm.deal(owner, 100 ether);
-        vm.deal(bundler, 100 ether);
-        vm.warp(1_800_000_000);
-
-        _fundDeposit(10 * COST);
-        vm.prank(owner);
-        vault.addStake{ value: 1 ether }(uint32(1 days));
+        c.minStake = MIN_STAKE;
+        c.minUnstakeDelaySec = MIN_UNSTAKE_DELAY;
     }
 
-    // --- helpers ---------------------------------------------------------------------------
+    /// A vault on the shared token with liquidity, no deposit and no stake yet.
+    function _deployVault() internal returns (MuunRingVault v) {
+        v = new MuunRingVault(_config());
+        token.mint(address(v), VAULT_USDT);
+    }
 
     /// Credit the vault's EntryPoint deposit. Permissionless, so no prank is needed.
     function _fundDeposit(uint256 amount) internal {
@@ -93,22 +103,18 @@ abstract contract VaultTestBase is Test {
         }
     }
 
-    function _lock(bytes32 swapId, uint48 expiry) internal {
+    function _lock(bytes32 swapId) internal {
         vm.prank(owner);
-        vault.lock(swapId, claimant, AMOUNT, expiry, idxOf(swapId));
+        vault.lock(swapId, claimant, AMOUNT, idxOf(swapId));
     }
 
-    function _defaultExpiry() internal view returns (uint48) {
-        return uint48(block.timestamp + 1 days);
-    }
-
-    function _exitCallData(bytes32 swapId, uint256 amount, address to, uint48 expiry)
+    function _exitCallData(bytes32 swapId, uint256 amount, address to)
         internal
         view
         returns (bytes memory)
     {
         bytes memory inner =
-            abi.encodeCall(MuunRingVault.claimSelf, (swapId, amount, to, expiry, idxOf(swapId)));
+            abi.encodeCall(MuunRingVault.claimSelf, (swapId, amount, to, idxOf(swapId)));
         return abi.encodeWithSignature(
             "execute(address,uint256,bytes)", address(vault), uint256(0), inner
         );
@@ -123,20 +129,14 @@ abstract contract VaultTestBase is Test {
         view
         returns (bytes memory)
     {
-        return abi.encodePacked(
-            address(vault), uint128(pmVerificationGas), uint128(postOpGas)
-        );
+        return abi.encodePacked(address(vault), uint128(pmVerificationGas), uint128(postOpGas));
     }
 
-    function _op(bytes32 swapId, uint48 expiry)
-        internal
-        view
-        returns (PackedUserOperation memory op)
-    {
+    function _op(bytes32 swapId) internal view returns (PackedUserOperation memory op) {
         op.sender = claimant;
         op.nonce = 0;
         op.initCode = hex"7702";
-        op.callData = _exitCallData(swapId, AMOUNT, recipient, expiry);
+        op.callData = _exitCallData(swapId, AMOUNT, recipient);
         op.accountGasLimits = _pack(VGL_CAP, CGL_CAP);
         op.preVerificationGas = PVG_CAP;
         op.gasFees = _pack(1 gwei, 10 gwei);

@@ -12,12 +12,10 @@ contract PaymasterValidationTest is VaultTestBase {
     uint256 internal constant SIG_FAILED = 1;
 
     bytes32 internal swapId = bytes32("a");
-    uint48 internal expiry;
 
     function setUp() public override {
         super.setUp();
-        expiry = _defaultExpiry();
-        _lock(swapId, expiry);
+        _lock(swapId);
         vm.signAndAttachDelegation(address(accountImpl), claimantKey);
     }
 
@@ -45,16 +43,15 @@ contract PaymasterValidationTest is VaultTestBase {
     // --- acceptance -------------------------------------------------------------------------
 
     function test_acceptsAWellFormedExit() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         assertEq(vault.sponsorshipRejection(op, COST), vault.REJECT_NONE());
 
         uint256 validationData = _validate(op, COST);
-        assertEq(uint160(validationData), 0, "signature field signals success");
-        assertEq((validationData >> 160) & type(uint48).max, expiry, "validUntil is the expiry");
+        assertEq(validationData, 0, "success, no validUntil: reservations do not expire (R2)");
     }
 
     function test_onlyEntryPointMayValidate() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         vm.expectRevert(
             abi.encodeWithSelector(MuunRingVault.NotFromEntryPoint.selector, address(this))
         );
@@ -70,25 +67,25 @@ contract PaymasterValidationTest is VaultTestBase {
     // --- budget and nonce -------------------------------------------------------------------
 
     function test_maxCostAtTheCapIsAccepted() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         assertEq(uint160(_validate(op, COST)), 0, "accepted at exactly the cap");
     }
 
     function test_maxCostAboveTheCapIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         assertEq(vault.sponsorshipRejection(op, COST + 1), vault.REJECT_MAX_COST());
         assertEq(_validate(op, COST + 1), SIG_FAILED);
     }
 
     /// One sponsored operation per claimant, and P is fresh per swap.
     function test_nonZeroNonceIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.nonce = 1;
         _expectReject(op, vault.REJECT_NONCE());
     }
 
     function test_nonZeroNonceKeyIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.nonce = uint256(1) << 64;
         _expectReject(op, vault.REJECT_NONCE());
     }
@@ -96,13 +93,13 @@ contract PaymasterValidationTest is VaultTestBase {
     // --- per-dimension gas caps -------------------------------------------------------------
 
     function test_verificationGasLimitCap() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.accountGasLimits = _pack(VGL_CAP + 1, CGL_CAP);
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
 
     function test_callGasLimitCap() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.accountGasLimits = _pack(VGL_CAP, CGL_CAP + 1);
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
@@ -110,32 +107,32 @@ contract PaymasterValidationTest is VaultTestBase {
     /// preVerificationGas is added to the charge verbatim by the EntryPoint, so it must be capped
     /// on its own rather than only through the maxCost product.
     function test_preVerificationGasCap() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.preVerificationGas = PVG_CAP + 1;
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
 
     function test_paymasterVerificationGasLimitCap() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.paymasterAndData = _paymasterAndData(PMV_CAP + 1, 0);
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
 
     function test_postOpGasLimitMustBeZero() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.paymasterAndData = _paymasterAndData(PMV_CAP, 1);
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
 
     /// An uncapped priority fee pins the charged gas price at maxFeePerGas regardless of basefee.
     function test_maxPriorityFeePerGasCap() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.gasFees = _pack(PRIORITY_CAP + 1, 10 gwei);
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
 
     function test_shortPaymasterAndDataIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.paymasterAndData = abi.encodePacked(address(vault));
         _expectReject(op, vault.REJECT_GAS_CAP());
     }
@@ -145,7 +142,7 @@ contract PaymasterValidationTest is VaultTestBase {
     function test_senderWithNoCodeIsDeclined() public {
         (address bare, uint256 bareKey) = makeAddrAndKey("bare");
         bareKey;
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.sender = bare;
         _expectReject(op, vault.REJECT_DELEGATE());
     }
@@ -155,13 +152,13 @@ contract PaymasterValidationTest is VaultTestBase {
         WrongAccount wrong = new WrongAccount();
         vm.signAndAttachDelegation(address(wrong), otherKey);
 
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.sender = vm.addr(otherKey);
         _expectReject(op, vault.REJECT_DELEGATE());
     }
 
     function test_senderThatIsAPlainContractIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.sender = address(new WrongAccount());
         _expectReject(op, vault.REJECT_DELEGATE());
     }
@@ -169,7 +166,7 @@ contract PaymasterValidationTest is VaultTestBase {
     // --- calldata shape -----------------------------------------------------------------------
 
     function test_wrongLengthIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory good = op.callData;
 
         op.callData = abi.encodePacked(good, hex"00");
@@ -184,7 +181,7 @@ contract PaymasterValidationTest is VaultTestBase {
     }
 
     function test_wrongOuterSelectorIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory cd = op.callData;
         cd[0] = 0xff;
         op.callData = cd;
@@ -192,9 +189,9 @@ contract PaymasterValidationTest is VaultTestBase {
     }
 
     function test_wrongTargetIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory inner =
-            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT, recipient, expiry, idxOf(swapId)));
+            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT, recipient, idxOf(swapId)));
         op.callData = abi.encodeWithSignature(
             "execute(address,uint256,bytes)", address(token), uint256(0), inner
         );
@@ -202,9 +199,9 @@ contract PaymasterValidationTest is VaultTestBase {
     }
 
     function test_nonZeroValueIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory inner =
-            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT, recipient, expiry, idxOf(swapId)));
+            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT, recipient, idxOf(swapId)));
         op.callData = abi.encodeWithSignature(
             "execute(address,uint256,bytes)", address(vault), uint256(1), inner
         );
@@ -212,12 +209,13 @@ contract PaymasterValidationTest is VaultTestBase {
     }
 
     function test_wrongInnerSelectorIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
-        bytes memory inner =
-            abi.encodeCall(MuunRingVault.claimBySig, (swapId, AMOUNT, recipient, expiry, "", idxOf(swapId)));
+        PackedUserOperation memory op = _op(swapId);
+        bytes memory inner = abi.encodeCall(
+            MuunRingVault.claimBySig, (swapId, AMOUNT, recipient, "", idxOf(swapId))
+        );
         // Force the encoding back to the exact exit length so only the selector differs.
-        bytes memory fixedInner = new bytes(164);
-        for (uint256 i = 0; i < 164; i++) {
+        bytes memory fixedInner = new bytes(132);
+        for (uint256 i = 0; i < 132; i++) {
             fixedInner[i] = inner[i];
         }
         op.callData = abi.encodeWithSignature(
@@ -227,18 +225,18 @@ contract PaymasterValidationTest is VaultTestBase {
     }
 
     function test_zeroRecipientIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory inner =
-            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT, address(0), expiry, idxOf(swapId)));
+            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT, address(0), idxOf(swapId)));
         op.callData = abi.encodeWithSignature(
             "execute(address,uint256,bytes)", address(vault), uint256(0), inner
         );
         _expectReject(op, vault.REJECT_CALLDATA());
     }
 
-    /// abi.decode rejects dirty upper bytes in the packed recipient and expiry words.
+    /// A dirty upper byte in the packed recipient word is declined, never decoded.
     function test_dirtyPaddingIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory cd = op.callData;
         cd[200] = 0x01; // high byte of the recipient word
         op.callData = cd;
@@ -248,7 +246,7 @@ contract PaymasterValidationTest is VaultTestBase {
     // --- reservation binding ------------------------------------------------------------------
 
     function test_unknownSwapIsDeclined() public {
-        PackedUserOperation memory op = _op(bytes32("nope"), expiry);
+        PackedUserOperation memory op = _op(bytes32("nope"));
         _expectReject(op, vault.REJECT_RESERVATION());
     }
 
@@ -256,31 +254,26 @@ contract PaymasterValidationTest is VaultTestBase {
         (, uint256 otherKey) = makeAddrAndKey("intruder");
         vm.signAndAttachDelegation(address(accountImpl), otherKey);
 
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.sender = vm.addr(otherKey);
         _expectReject(op, vault.REJECT_RESERVATION());
     }
 
     function test_wrongAmountIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         bytes memory inner =
-            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT + 1, recipient, expiry, idxOf(swapId)));
+            abi.encodeCall(MuunRingVault.claimSelf, (swapId, AMOUNT + 1, recipient, idxOf(swapId)));
         op.callData = abi.encodeWithSignature(
             "execute(address,uint256,bytes)", address(vault), uint256(0), inner
         );
         _expectReject(op, vault.REJECT_RESERVATION());
     }
 
-    function test_wrongExpiryIsDeclined() public {
-        PackedUserOperation memory op = _op(swapId, expiry + 1);
-        _expectReject(op, vault.REJECT_RESERVATION());
-    }
-
     function test_consumedReservationIsDeclined() public {
         vm.prank(claimant);
-        vault.claimSelf(swapId, AMOUNT, recipient, expiry, idxOf(swapId));
+        vault.claimSelf(swapId, AMOUNT, recipient, idxOf(swapId));
 
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         assertEq(vault.sponsorshipRejection(op, COST), vault.REJECT_RESERVATION());
     }
 }

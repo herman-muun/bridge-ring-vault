@@ -7,17 +7,18 @@
 //   0. setup: deploys both vaults over the byte-exact mainnet USDT copy, funds their USDT, their
 //      EntryPoint deposit and stake (none of this is in a per-swap figure); a bare USDT transfer
 //      to a fresh recipient W and a second one to W: the floor, and W is warm from then on;
-//   1. round "first": for each vault, five locks (ring indices 0..4 used for the first time):
+//   1. round "first": for each vault, the shapes below (ring indices 0..2 used for the first time):
 //        A  lock, then claimBySig to W (warm recipient)
 //        B  lock, then claimBySig to a fresh recipient (cold)
-//        C  lock with a short expiry, then refund once it expired
+//        C  legacy only: lock with a short expiry, then refund once it expired
 //        D  lock for a zero-ETH claimant, then the sponsored EIP-7702 + ERC-4337 claimSelf to W,
 //           self-bundled through EntryPoint.handleOps by the bundler key
-//        E  lock with a short expiry, left to expire unconsumed
-//   2. round "reuse": the same five shapes; the ring rewrites indices 0..4 (steady state). Its
-//      lock E rewrites the expired, unconsumed slot and releases it inline; the legacy vault
-//      needs a refund transaction for its old E first, which is measured too.
-//   3. cleanup: refunds what is still expired and withdraws the surplus deposit.
+//        E  legacy only: lock with a short expiry, left to expire unconsumed
+//      The ring vault has no expiry and no refund since the hardening pass of 2026-10-02 (rule
+//      R2): a reservation ends only with a claim, so C and E have no ring counterpart.
+//   2. round "reuse": the same shapes; the ring rewrites indices 0..2 (steady state); the legacy
+//      vault needs a refund transaction for its old E first, which is measured too.
+//   3. cleanup: refunds what is still expired on the legacy vault and withdraws the surplus deposit.
 //
 // Env (names only): GLAMSTERDAM_RPC_URL, GLAMSTERDAM_PRIVATE_KEY (owner of both vaults and of
 // the USDT copy), BUNDLER_PRIVATE_KEY, ENTRY_POINT_ADDRESS, SIMPLE_7702_ACCOUNT_ADDRESS,
@@ -55,6 +56,10 @@ const ENVELOPE = CAPS.preVerificationGasCap + CAPS.verificationGasLimitCap + CAP
 const EXIT_COST = ENVELOPE * CAPS.maxSponsoredFeePerGas; // 0.035 ETH at the defaults
 const DEPOSIT_PER_VAULT = bigintEnv("SPONSORSHIP_DEPOSIT_WEI", 6n * EXIT_COST); // at most 6 live reservations per vault in a run
 const STAKE = bigintEnv("PAYMASTER_STAKE_WEI", 10_000_000_000_000_000n); // 0.01 ETH; self-bundled, no bundler policy to satisfy
+const UNSTAKE_DELAY = 86_400;
+// R7 of the ring vault: the floors `lock` requires of the EntryPoint stake. The run stakes exactly
+// the floor; production values are a deployment decision (see docs/decisions.md #9).
+const RING_FLOORS = { minStake: bigintEnv("MIN_STAKE_WEI", STAKE), minUnstakeDelaySec: Number(process.env.MIN_UNSTAKE_DELAY_SEC ?? UNSTAKE_DELAY) };
 const LIQUIDITY = AMOUNT * 30n;
 const BUNDLER_MIN_ETH = 50_000_000_000_000_000n;
 // bridge-vault's receipts of 2026-08-31 (reports/ETH_GAS_REPORT.md there), on MockUSDT, same devnet.
@@ -184,9 +189,10 @@ const fidelity = {};
 
 // ------------------------------------------------------------------ vaults
 const config = { token: USDT, owner: actor.address, entryPoint: ENTRY_POINT, accountImplementation: ACCOUNT_IMPL, ...CAPS };
+// Shapes per vault: the ring has no expiry, so the expiry shapes C and E are legacy only.
 const VAULTS = {
-  legacy: { label: "legacy MuunUSDTVault (mapping)", art: legacyArt, envName: "LEGACY_VAULT_ADDRESS", source: "contracts/legacy/MuunUSDTVault.sol (bridge-vault, verbatim)", version: "1" },
-  ring: { label: "MuunRingVault (ring)", art: ringArt, envName: "RING_VAULT_ADDRESS", source: "contracts/MuunRingVault.sol", version: "2" },
+  legacy: { label: "legacy MuunUSDTVault (mapping)", art: legacyArt, envName: "LEGACY_VAULT_ADDRESS", source: "contracts/legacy/MuunUSDTVault.sol (bridge-vault, verbatim)", version: "1", config, steps: ["A", "B", "C", "D", "E"], hasExpiry: true },
+  ring: { label: "MuunRingVault (ring, no expiry)", art: ringArt, envName: "RING_VAULT_ADDRESS", source: "contracts/MuunRingVault.sol", version: "3", config: { ...config, ...RING_FLOORS }, steps: ["A", "B", "D"], hasExpiry: false },
 };
 // Reads pinned to a block retry on "returned no data": the public RPC load-balances over nodes
 // and one of them may not have that block yet.
@@ -216,7 +222,7 @@ for (const [key, v] of Object.entries(VAULTS)) {
   v.key = key;
   v.address = process.env[v.envName] ? getAddress(process.env[v.envName]) : null;
   if (!v.address) {
-    const m = await sendTx(`${key}: deploy ${v.label} over the USDT copy`, { data: encodeDeployData({ abi: v.art.abi, bytecode: v.art.bytecode.object, args: [config] }) });
+    const m = await sendTx(`${key}: deploy ${v.label} over the USDT copy`, { data: encodeDeployData({ abi: v.art.abi, bytecode: v.art.bytecode.object, args: [v.config] }) });
     v.address = getAddress(m.receipt.contractAddress);
     log(`  ${v.label} at ${v.address} (${m.metric.gasUsed} gas); reuse with ${v.envName}`);
     setup.push({ vault: key, what: `deploy ${v.label}`, contract: v.address, ...m.metric });
@@ -239,7 +245,7 @@ for (const [key, v] of Object.entries(VAULTS)) {
     setup.push({ vault: key, what: "EntryPoint.depositTo(vault)", ...(await call(`${key}: depositTo`, { address: ENTRY_POINT, abi: epAbi, functionName: "depositTo", args: [v.address], value: requiredNow + DEPOSIT_PER_VAULT - info.deposit })).metric });
   }
   if (!info.staked) {
-    setup.push({ vault: key, what: "vault.addStake", ...(await call(`${key}: addStake`, { address: v.address, abi: v.art.abi, functionName: "addStake", args: [86_400], value: STAKE })).metric });
+    setup.push({ vault: key, what: "vault.addStake", ...(await call(`${key}: addStake`, { address: v.address, abi: v.art.abi, functionName: "addStake", args: [UNSTAKE_DELAY], value: STAKE })).metric });
   }
 }
 
@@ -253,9 +259,16 @@ for (const state of ["cold", "warm"]) {
 
 // ------------------------------------------------------------------ the measured steps
 const IDX_BASE = Number(process.env.RING_IDX_BASE ?? 0); // shift after an aborted run left indices live
-const IDX = { A: IDX_BASE, B: IDX_BASE + 1, C: IDX_BASE + 2, D: IDX_BASE + 3, E: IDX_BASE + 4 };
-const lockArgs = (v, s) => (v.key === "ring" ? [s.swapId, s.claimant.address, AMOUNT, s.expiry, IDX[s.step]] : [s.swapId, s.claimant.address, AMOUNT, s.expiry]);
-const withIdx = (v, s, args) => (v.key === "ring" ? [...args, IDX[s.step]] : args);
+const IDX = { A: IDX_BASE, B: IDX_BASE + 1, D: IDX_BASE + 2 };
+// Argument shapes. Legacy: `lock(swapId, claimant, amount, expiry)`, `claimBySig(swapId, amount,
+// recipient, expiry, sig)`, `claimSelf(swapId, amount, recipient, expiry)`. Ring: no expiry, `idx`
+// last: `lock(swapId, claimant, amount, idx)`, `claimBySig(swapId, amount, recipient, sig, idx)`,
+// `claimSelf(swapId, amount, recipient, idx)`.
+const lockArgs = (v, s) => (v.hasExpiry ? [s.swapId, s.claimant.address, AMOUNT, s.expiry] : [s.swapId, s.claimant.address, AMOUNT, IDX[s.step]]);
+const claimBySigArgs = (v, s, recipient, signature) => (v.hasExpiry ? [s.swapId, AMOUNT, recipient, s.expiry, signature] : [s.swapId, AMOUNT, recipient, signature, IDX[s.step]]);
+const claimSelfArgs = (v, s, recipient) => (v.hasExpiry ? [s.swapId, AMOUNT, recipient, s.expiry] : [s.swapId, AMOUNT, recipient, IDX[s.step]]);
+const refundArgs = (v, s) => [s.swapId, s.claimant.address, AMOUNT, s.expiry];
+const CLAIM_TYPES = (v) => ({ Claim: [{ name: "swapId", type: "bytes32" }, { name: "amount", type: "uint256" }, { name: "recipient", type: "address" }, ...(v.hasExpiry ? [{ name: "expiry", type: "uint48" }] : [])] });
 const record = (v, round, s, shape, op, m, extra = {}) => {
   const rec = { vault: v.key, round, step: s.step, shape, op, swapId: s.swapId, idx: v.key === "ring" ? IDX[s.step] : null, ...extra, ...m.metric, explorer: tx(m.metric.transactionHash) };
   receipts.push(rec);
@@ -272,30 +285,31 @@ function assertEntry(v, s, receipt, consumed) {
   const ev = parseEventLogs({ abi: v.art.abi, logs: receipt.logs, eventName: name }).find((e) => e.args.swapId === s.swapId);
   if (!ev) throw new Error(`${v.key}: no ${name} event for ${s.swapId} in ${receipt.transactionHash}`);
   if (getAddress(ev.args.claimant) !== s.claimant.address || ev.args.amount !== AMOUNT) throw new Error(`${v.key}: ${name} event fields do not match the reservation`);
-  if (!consumed && BigInt(ev.args.expiry) !== s.expiry) throw new Error(`${v.key}: Locked expiry ${ev.args.expiry} != ${s.expiry}`);
+  if (!consumed && v.hasExpiry && BigInt(ev.args.expiry) !== s.expiry) throw new Error(`${v.key}: Locked expiry ${ev.args.expiry} != ${s.expiry}`);
   if (v.key === "ring" && ev.args.idx !== undefined && Number(ev.args.idx) !== IDX[s.step]) throw new Error(`${v.key}: ${name} idx ${ev.args.idx} != ${IDX[s.step]}`);
 }
 
 async function lock(v, round, s) {
-  // The expiry is set from the head at send time: a send can take a minute on the public RPC.
-  s.expiry = (await R(() => pub.getBlock())).timestamp + s.ttl;
+  // Legacy only: the expiry is set from the head at send time (a send can take a minute on the
+  // public RPC). The ring vault has no expiry.
+  if (v.hasExpiry) s.expiry = (await R(() => pub.getBlock())).timestamp + s.ttl;
   const m = await call(`${v.key}: round ${round}, lock ${s.step}${v.key === "ring" ? ` at idx ${IDX[s.step]}` : ""}`, { address: v.address, abi: v.art.abi, functionName: "lock", args: lockArgs(v, s) });
-  const released = parseEventLogs({ abi: v.art.abi, logs: m.receipt.logs, eventName: "Released" }).length > 0;
-  const rec = record(v, round, s, `lock ${s.step}${released ? " (rewrites the expired slot, releases it inline)" : ""}`, "lock", m, { expiry: s.expiry, claimant: s.claimant.address, releasedInline: released });
+  const rec = record(v, round, s, `lock ${s.step}`, "lock", m, { ...(v.hasExpiry ? { expiry: s.expiry } : {}), claimant: s.claimant.address });
   assertEntry(v, s, m.receipt, false);
   return rec;
 }
 
 async function claimBySig(v, round, s, recipient, state) {
-  const signature = await s.claimant.signTypedData({ domain: v.domain, types: { Claim: [{ name: "swapId", type: "bytes32" }, { name: "amount", type: "uint256" }, { name: "recipient", type: "address" }, { name: "expiry", type: "uint48" }] }, primaryType: "Claim", message: { swapId: s.swapId, amount: AMOUNT, recipient, expiry: s.expiry } });
-  const m = await call(`${v.key}: round ${round}, claimBySig ${s.step}, ${state} recipient`, { address: v.address, abi: v.art.abi, functionName: "claimBySig", args: withIdx(v, s, [s.swapId, AMOUNT, recipient, s.expiry, signature]) });
+  const signature = await s.claimant.signTypedData({ domain: v.domain, types: CLAIM_TYPES(v), primaryType: "Claim", message: { swapId: s.swapId, amount: AMOUNT, recipient, ...(v.hasExpiry ? { expiry: s.expiry } : {}) } });
+  const m = await call(`${v.key}: round ${round}, claimBySig ${s.step}, ${state} recipient`, { address: v.address, abi: v.art.abi, functionName: "claimBySig", args: claimBySigArgs(v, s, recipient, signature) });
   assertEntry(v, s, m.receipt, true);
   const before = await balanceBefore(recipient, m.receipt.blockNumber);
   return record(v, round, s, `claimBySig ${s.step}, ${state} recipient`, "claimBySig", m, { recipient, recipientBalanceBefore: before });
 }
 
 async function refund(v, round, s, shape = `refund ${s.step} after expiry`) {
-  const m = await call(`${v.key}: round ${round}, ${shape}`, { address: v.address, abi: v.art.abi, functionName: "refund", args: withIdx(v, s, [s.swapId, s.claimant.address, AMOUNT, s.expiry]) });
+  if (!v.hasExpiry) throw new Error(`${v.key}: no refund on a vault without expiry`);
+  const m = await call(`${v.key}: round ${round}, ${shape}`, { address: v.address, abi: v.art.abi, functionName: "refund", args: refundArgs(v, s) });
   assertEntry(v, { ...s, consumedBy: "Refunded" }, m.receipt, true);
   return record(v, round, s, shape, "refund", m);
 }
@@ -307,7 +321,7 @@ async function sponsoredClaimSelf(v, round, s, recipient) {
   const [userOpNonce, authNonce, depositBefore] = await Promise.all([epRead("getNonce", [claimant.address, 0n]), R(() => pub.getTransactionCount({ address: claimant.address, blockTag: "pending" })), epRead("balanceOf", [v.address])]);
   const fees = { maxPriorityFeePerGas: 1_000_000_000n, maxFeePerGas: 1_000_000_000n }; // within the 2 gwei priority cap; 700k x 1 gwei << EXIT_COST
   const pack128 = (hi, lo) => concatHex([toHex(hi, { size: 16 }), toHex(lo, { size: 16 })]);
-  const inner = encodeFunctionData({ abi: v.art.abi, functionName: "claimSelf", args: withIdx(v, s, [s.swapId, AMOUNT, recipient, s.expiry]) });
+  const inner = encodeFunctionData({ abi: v.art.abi, functionName: "claimSelf", args: claimSelfArgs(v, s, recipient) });
   const outer = encodeFunctionData({ abi: acctAbi, functionName: "execute", args: [v.address, 0n, inner] });
   const userOp = { sender: claimant.address, nonce: userOpNonce, initCode: "0x7702", callData: outer, accountGasLimits: pack128(CAPS.verificationGasLimitCap, CAPS.callGasLimitCap), preVerificationGas: CAPS.preVerificationGasCap, gasFees: pack128(fees.maxPriorityFeePerGas, fees.maxFeePerGas), paymasterAndData: concatHex([v.address, toHex(CAPS.paymasterVerificationGasLimitCap, { size: 16 }), toHex(0n, { size: 16 })]), signature: "0x" };
   const maxCost = ENVELOPE * fees.maxFeePerGas;
@@ -339,36 +353,35 @@ async function sponsoredClaimSelf(v, round, s, recipient) {
 }
 
 const errors = [];
-const pending = { legacy: { E: null }, ring: { E: null } }; // E of the previous round, expired unconsumed
+const pending = { legacy: { E: null } }; // E of the previous round, expired unconsumed (legacy only)
 try {
   for (const round of ["first", "reuse"]) {
     const swaps = {};
     for (const v of Object.values(VAULTS)) {
       swaps[v.key] = {};
-      for (const step of ["A", "B", "C", "D", "E"]) {
+      for (const step of v.steps) {
         swaps[v.key][step] = { step, swapId: freshSwapId(), claimant: freshKey().account, ttl: step === "C" || step === "E" ? TTL_SHORT : TTL_LONG };
       }
     }
     // Round reuse: the legacy vault must refund its old E before anything (nothing forces it, but
-    // it is the transaction the ring saves); the ring's lock E rewrites the expired slot directly.
+    // it is a transaction the ring never needs: it has no expired reservations).
     if (round === "reuse" && pending.legacy.E) {
       await waitPastTimestamp(pending.legacy.E.expiry);
-      await refund(VAULTS.legacy, round, pending.legacy.E, "refund of the expired E of round first (the transaction the ring saves)");
+      await refund(VAULTS.legacy, round, pending.legacy.E, "refund of the expired E of round first (a transaction the ring never needs)");
     }
-    if (round === "reuse" && pending.ring.E) await waitPastTimestamp(pending.ring.E.expiry);
-    for (const v of Object.values(VAULTS)) for (const step of ["A", "B", "C", "D", "E"]) await lock(v, round, swaps[v.key][step]);
+    for (const v of Object.values(VAULTS)) for (const step of v.steps) await lock(v, round, swaps[v.key][step]);
     for (const v of Object.values(VAULTS)) {
       await claimBySig(v, round, swaps[v.key].A, W, "warm");
       await claimBySig(v, round, swaps[v.key].B, freshKey().account.address, "cold");
       await sponsoredClaimSelf(v, round, swaps[v.key].D, W);
     }
-    await waitPastTimestamp(swaps.ring.C.expiry > swaps.legacy.C.expiry ? swaps.ring.C.expiry : swaps.legacy.C.expiry);
-    for (const v of Object.values(VAULTS)) await refund(v, round, swaps[v.key].C);
-    for (const v of Object.values(VAULTS)) pending[v.key].E = swaps[v.key].E;
+    await waitPastTimestamp(swaps.legacy.C.expiry);
+    await refund(VAULTS.legacy, round, swaps.legacy.C);
+    pending.legacy.E = swaps.legacy.E;
   }
-  // cleanup: release the last E of each vault and hand the surplus deposit back to the actor
+  // cleanup: release the legacy vault's last E and hand the surplus deposit back to the actor
   for (const v of Object.values(VAULTS)) {
-    if (pending[v.key].E) { await waitPastTimestamp(pending[v.key].E.expiry); await refund(v, "cleanup", pending[v.key].E, "refund of the expired E of round reuse (cleanup)"); }
+    if (pending[v.key]?.E) { await waitPastTimestamp(pending[v.key].E.expiry); await refund(v, "cleanup", pending[v.key].E, "refund of the expired E of round reuse (cleanup)"); }
     const [dep, required] = await Promise.all([vread(v, "sponsorshipDeposit"), vread(v, "requiredSponsorship")]);
     if (dep > required) setup.push({ vault: v.key, what: "withdrawETH from the deposit (cleanup)", ...(await call(`${v.key}: withdraw surplus deposit`, { address: v.address, abi: v.art.abi, functionName: "withdrawETH", args: [actor.address, dep - required, true] })).metric });
   }
@@ -392,7 +405,8 @@ const report = {
   blockAtStart: { number: head.number, baseFeePerGas: head.baseFeePerGas, gasLimit: head.gasLimit }, blockAtEnd: { number: endBlock.number, baseFeePerGas: endBlock.baseFeePerGas },
   actor: actor.address, bundler: bundler.address, ringIndexBase: IDX_BASE, entryPoint: ENTRY_POINT, accountImplementation: ACCOUNT_IMPL, token: USDT, amount: AMOUNT, ttlShort: TTL_SHORT, ttlLong: TTL_LONG, warmRecipient: W,
   caps: { ...CAPS, envelope: ENVELOPE, emergencyExitCost: EXIT_COST },
-  vaults: Object.fromEntries(Object.values(VAULTS).map((v) => [v.key, { label: v.label, address: v.address, source: v.source, runtimeBytes: v.runtimeBytes, eip712Version: v.version }])),
+  vaults: Object.fromEntries(Object.values(VAULTS).map((v) => [v.key, { label: v.label, address: v.address, source: v.source, runtimeBytes: v.runtimeBytes, eip712Version: v.version, steps: v.steps, hasExpiry: v.hasExpiry }])),
+  ringFloors: RING_FLOORS,
   fidelity, setup, receipts, errors, prior: PRIOR,
 };
 const jsonPath = await writeReport(`${REPORT}.json`, report);
@@ -404,29 +418,29 @@ if (errors.length) process.exit(1);
 // ------------------------------------------------------------------ markdown
 function renderMd(rep) {
   const short = (h) => (rep.explorer ? `[\`${h.slice(0, 10)}…\`](${rep.explorer}/tx/${h})` : `\`${h.slice(0, 10)}…\``);
-  const addr = (a) => `[\`${a}\`](${rep.explorer}/address/${a})`;
-  const blk = (n) => `[${n}](${rep.explorer}/block/${n})`;
+  const addr = (a) => (rep.explorer ? `[\`${a}\`](${rep.explorer}/address/${a})` : `\`${a}\``);
+  const blk = (n) => (rep.explorer ? `[${n}](${rep.explorer}/block/${n})` : `${n}`);
+  const local = !rep.explorer;
   const fmt = (n) => (n === null || n === undefined ? "–" : Number(n).toLocaleString("en-US"));
   const n = (x) => Number(x);
   const find = (vault, round, re) => rep.receipts.find((r) => r.vault === vault && r.round === round && re.test(r.shape));
   const d = (a, b) => (a && b ? fmt(n(a.gasUsed) - n(b.gasUsed)) : "–");
   const L = [];
-  L.push("# Bridge vault with a reservation ring under Glamsterdam gas rules: devnet receipts", "");
+  L.push(`# Bridge vault with a reservation ring under Glamsterdam gas rules: ${local ? "local node" : "devnet"} receipts`, "");
   const where = rep.explorer
     ? `on the public Glamsterdam devnet **Platåberget** (chainId ${rep.chainId}; the public RPC load-balances over several execution clients, the one that answered \`web3_clientVersion\` at start was \`${rep.clientVersion ?? "unknown"}\`; basefee ${rep.blockAtStart.baseFeePerGas} wei, block gas limit ${fmt(rep.blockAtStart.gasLimit)}), explorer [dora](${rep.explorer})`
     : `on a **local go-ethereum node with Amsterdam active from genesis** (the \`glamsterdam-local\` repo; chainId ${rep.chainId}, client \`${rep.clientVersion ?? "unknown"}\`; basefee ${rep.blockAtStart.baseFeePerGas} wei, block gas limit ${fmt(rep.blockAtStart.gasLimit)}); no explorer, transaction hashes are shown as is`;
   L.push(`Measured ${rep.ranAt.slice(0, 10)} (${rep.ranAt}) ${where}. Script: \`npm run measure:glam\` (\`scripts/measure-glamsterdam-vault.mjs\`); machine-readable evidence: \`reports/${REPORT}.json\`.`, "");
-  L.push(`Two vaults, same run, same token, same owner ${addr(rep.actor)}: the **legacy** \`MuunUSDTVault\` of bridge-vault (${rep.vaults.legacy.source}, ${rep.vaults.legacy.runtimeBytes} runtime bytes, one fresh \`reservations[swapId]\` slot per swap, deleted on claim) at ${addr(rep.vaults.legacy.address)}, and the **ring** \`MuunRingVault\` (${rep.vaults.ring.source}, ${rep.vaults.ring.runtimeBytes} runtime bytes, \`bytes32[2**32] ring\`, an index per reservation, overwritten with \`CONSUMED\` on claim and rewritten by the next lock) at ${addr(rep.vaults.ring.address)}. Both sit on the byte-exact mainnet USDT copy ${addr(rep.token)}, use EntryPoint v0.9 ${addr(rep.entryPoint)} and the \`Simple7702Account\` delegate ${addr(rep.accountImplementation)} already on the devnet, and reserve ${Number(rep.amount) / 1e6} USDT per swap. Round **first** uses ring indices ${rep.ringIndexBase ?? 0}..${(rep.ringIndexBase ?? 0) + 4} for the first time (the fresh-slot premium is in it); round **reuse** rewrites them (the steady state). "Cold" = the recipient had never held the token; "warm" = it already did. Every gas figure below is a receipt's \`gasUsed\`; nothing is an estimate.`, "");
+  L.push(`Two vaults, same run, same token, same owner ${addr(rep.actor)}: the **legacy** \`MuunUSDTVault\` of bridge-vault (${rep.vaults.legacy.source}, ${rep.vaults.legacy.runtimeBytes} runtime bytes, one fresh \`reservations[swapId]\` slot per swap, deleted on claim) at ${addr(rep.vaults.legacy.address)}, and the **ring** \`MuunRingVault\` (${rep.vaults.ring.source}, ${rep.vaults.ring.runtimeBytes} runtime bytes, \`bytes32[2**32] ring\`, an index per reservation holding the full 256-bit \`keccak(swapId, claimant, amount)\`, overwritten with \`CONSUMED\` on claim and rewritten by the next lock; no expiry and no refund, a reservation ends only with a claim) at ${addr(rep.vaults.ring.address)}. Both sit on the byte-exact mainnet USDT copy ${addr(rep.token)}, use EntryPoint v0.9 ${addr(rep.entryPoint)} and the \`Simple7702Account\` delegate ${addr(rep.accountImplementation)} already on the ${local ? "node" : "devnet"}, and reserve ${Number(rep.amount) / 1e6} USDT per swap. Round **first** uses ring indices ${rep.ringIndexBase ?? 0}..${(rep.ringIndexBase ?? 0) + 2} for the first time (the fresh-slot premium is in it); round **reuse** rewrites them (the steady state). Shapes C and E (an expiring reservation, a refund) exist on the legacy vault only: the ring has nothing to expire. "Cold" = the recipient had never held the token; "warm" = it already did. Every gas figure below is a receipt's \`gasUsed\`; nothing is an estimate.`, "");
 
   L.push("## Result: legacy vault against ring vault, step by step", "");
   L.push("- What the table shows: for each round and step, the receipt's `gasUsed` of the same operation on the legacy vault and on the ring vault, and the difference (ring minus legacy, arithmetic on two receipts). The `handleOps` rows are the outer transaction of the sponsored EIP-7702 + ERC-4337 `claimSelf`; the `actualGasUsed` the EntryPoint charged is in the receipts table further down.", "");
   L.push("| Round | Step | legacy gasUsed | ring gasUsed | Δ ring − legacy | legacy tx | ring tx |", "|---|---|---:|---:|---:|---|---|");
-  const STEPS = [["lock A", /^lock A/], ["claimBySig A, warm recipient", /^claimBySig A/], ["lock B", /^lock B/], ["claimBySig B, cold recipient", /^claimBySig B/], ["lock C", /^lock C/], ["refund C after expiry", /^refund C/], ["lock D", /^lock D/], ["sponsored claimSelf D (handleOps outer)", /^sponsored .* D/], ["lock E", /^lock E/], ["refund of the expired E of the previous round", /^refund of the expired E of round first/]];
+  const STEPS = [["lock A", /^lock A/], ["claimBySig A, warm recipient", /^claimBySig A/], ["lock B", /^lock B/], ["claimBySig B, cold recipient", /^claimBySig B/], ["lock C (legacy only: expiring reservation)", /^lock C/], ["refund C after expiry (legacy only)", /^refund C/], ["lock D", /^lock D/], ["sponsored claimSelf D (handleOps outer)", /^sponsored .* D/], ["lock E (legacy only: left to expire)", /^lock E/], ["refund of the expired E of the previous round (legacy only)", /^refund of the expired E of round first/]];
   for (const round of ["first", "reuse"]) for (const [label, re] of STEPS) {
     const l = find("legacy", round, re), r = find("ring", round, re);
     if (!l && !r) continue;
-    const rl = r && r.releasedInline ? `${label} (ring: rewrites the expired slot, releases inline)` : label;
-    L.push(`| ${round} | ${rl} | ${l ? `**${fmt(l.gasUsed)}**` : "–"} | ${r ? `**${fmt(r.gasUsed)}**` : "–"} | ${d(r, l)} | ${l ? short(l.transactionHash) : "–"} | ${r ? short(r.transactionHash) : "–"} |`);
+    L.push(`| ${round} | ${label} | ${l ? `**${fmt(l.gasUsed)}**` : "–"} | ${r ? `**${fmt(r.gasUsed)}**` : "–"} | ${r ? d(r, l) : "n/a"} | ${l ? short(l.transactionHash) : "–"} | ${r ? short(r.transactionHash) : "–"} |`);
   }
   const fc = find("floor", "floor", /cold/), fw = find("floor", "floor", /warm/);
   if (fc && fw) L.push(`| floor | bare USDT transfer, cold / warm recipient | ${fmt(fc.gasUsed)} / ${fmt(fw.gasUsed)} | same | – | ${short(fc.transactionHash)} | ${short(fw.transactionHash)} |`);
@@ -453,17 +467,18 @@ function renderMd(rep) {
   row(`happy path, cold (\`lock\` + \`claimBySig\`)${fbNote(lcB, rcB)}`, sum(lB, lcB), sum(rB, rcB), fmt(n(rep.prior.lock.gasUsed) + n(rep.prior.claimBySigCold.gasUsed)));
   row(`escape hatch (\`lock\` + sponsored \`claimSelf\`, outer tx)${fbNote(lhD, rhD)}`, sum(lD, lhD), sum(rD, rhD), `${fmt(n(rep.prior.recoveryLock.gasUsed) + n(rep.prior.recoveryHandleOps.gasUsed))} ${short(rep.prior.recoveryHandleOps.tx)}`);
   row(`sponsored \`claimSelf\`, \`actualGasUsed\` charged by the EntryPoint${fbNote(lhD, rhD)}`, lhD && n(lhD.actualGasUsed), rhD && n(rhD.actualGasUsed), fmt(rep.prior.recoveryHandleOps.actualGasUsed));
-  row(`expired swap (\`lock\` + \`refund\`)${fbNote(lrC, rrC)}`, sum(lC, lrC), sum(rC, rrC), "–");
+  row(`expired swap (\`lock\` + \`refund\`)${fbNote(lrC, rrC)}; the ring has no expiry`, sum(lC, lrC), sum(rC, rrC), "–");
   L.push("");
 
   L.push("## Reading the receipts", "");
   const fA = find("ring", "first", /^lock A/), lfA = find("legacy", "first", /^lock A/);
   if (fA && rA) L.push(`- Fresh-slot premium as paid on the ring: lock A first use ${fmt(fA.gasUsed)} against reuse ${fmt(rA.gasUsed)}, ${fmt(n(fA.gasUsed) - n(rA.gasUsed))} gas. The legacy vault pays it on every lock (first ${lfA ? fmt(lfA.gasUsed) : "–"}, reuse ${lA ? fmt(lA.gasUsed) : "–"}: no reuse to speak of).`);
   if (lA && rA) L.push(`- Steady-state \`lock\`: ring ${fmt(rA.gasUsed)} against legacy ${fmt(lA.gasUsed)}, ${fmt(n(lA.gasUsed) - n(rA.gasUsed))} gas less per swap.`);
-  if (lcA && rcA) L.push(`- \`claimBySig\` (warm${lcA.fromFirst || rcA.fromFirst ? ", round first" : ""}): ring ${fmt(rcA.gasUsed)} against legacy ${fmt(lcA.gasUsed)}, ${fmt(n(rcA.gasUsed) - n(lcA.gasUsed))} gas ${n(rcA.gasUsed) >= n(lcA.gasUsed) ? "more" : "less"}: the ring writes \`CONSUMED\` (non-zero to non-zero) where the legacy vault deletes the slot and earns the clearing refund, and it carries one more calldata word and one more event field. The same delta shows on the cold claim${lrC && rrC ? ` and, without any transfer, on \`refund\` (${fmt(rrC.gasUsed)} against ${fmt(lrC.gasUsed)})` : ""}.`);
+  if (lcA && rcA) L.push(`- \`claimBySig\` (warm${lcA.fromFirst || rcA.fromFirst ? ", round first" : ""}): ring ${fmt(rcA.gasUsed)} against legacy ${fmt(lcA.gasUsed)}, ${fmt(n(rcA.gasUsed) - n(lcA.gasUsed))} gas ${n(rcA.gasUsed) >= n(lcA.gasUsed) ? "more" : "less"}: the ring writes \`CONSUMED\` (non-zero to non-zero) where the legacy vault deletes the slot and earns the clearing refund, and it carries one more calldata word (\`idx\`) and one more event field, minus the \`expiry\` word and the time check it no longer has. The same delta shows on the cold claim.`);
   if (lA && rA && lcA && rcA) L.push(`- Net per happy-path swap, warm: ${fmt(n(lA.gasUsed) + n(lcA.gasUsed) - n(rA.gasUsed) - n(rcA.gasUsed))} gas less on the ring (${fmt(n(rA.gasUsed) + n(rcA.gasUsed))} against ${fmt(n(lA.gasUsed) + n(lcA.gasUsed))}).`);
-  const rE = find("ring", "reuse", /^lock E/), lE = find("legacy", "reuse", /^lock E/), lrE = find("legacy", "reuse", /^refund of the expired E/);
-  if (rE && lE && lrE) L.push(`- Reusing an expired, unconsumed reservation: the ring's lock E rewrites the slot and releases it inline in ${fmt(rE.gasUsed)} gas; the legacy vault needs \`refund\` ${fmt(lrE.gasUsed)} plus \`lock\` ${fmt(lE.gasUsed)} = ${fmt(n(lrE.gasUsed) + n(lE.gasUsed))}, two transactions.`);
+  const lE = find("legacy", "reuse", /^lock E/), lrE = find("legacy", "reuse", /^refund of the expired E/);
+  if (lE && lrE) L.push(`- An expired, unconsumed reservation costs the legacy vault \`refund\` ${fmt(lrE.gasUsed)} plus the next \`lock\` ${fmt(lE.gasUsed)} = ${fmt(n(lrE.gasUsed) + n(lE.gasUsed))}, two transactions. The ring has no such path: a reservation never expires (R2), an abandoned one keeps its index and its liquidity for ever, and the next swap takes another index.`);
+  if (rep.ringFloors) L.push(`- The ring's \`lock\` also checks the EntryPoint stake against its floors (R7: \`MIN_STAKE\` ${formatEther(BigInt(rep.ringFloors.minStake))} ETH, \`MIN_UNSTAKE_DELAY\` ${fmt(rep.ringFloors.minUnstakeDelaySec)} s in this run): two comparisons on the \`getDepositInfo\` read it already made.`);
   if (lhD && rhD) L.push(`- The escape hatch is unchanged in kind: the sponsored \`claimSelf\` costs the EntryPoint \`actualGasUsed\` ${fmt(rhD.actualGasUsed)} on the ring against ${fmt(lhD.actualGasUsed)} on the legacy vault; the claimant held zero ETH before and after in both, with no prerequisite transaction (${rhD.noPrerequisiteClaimantTransaction && lhD.noPrerequisiteClaimantTransaction ? "authorization nonce 0 in both" : "see receipts"}).`);
   if (fc && fw && rcA) L.push(`- Floor: a bare USDT transfer is ${fmt(fw.gasUsed)} warm / ${fmt(fc.gasUsed)} cold; the cold column is the recipient's fresh balance slot in the token, the same on both vaults and on any design.`);
   const deps = rep.setup.filter((s) => /deploy/.test(s.what));
@@ -473,14 +488,14 @@ function renderMd(rep) {
     L.push("## What did not run", "");
     for (const e of rep.errors) L.push(`- The run stopped at: \`${e.message}\`.`);
     const missing = [];
-    for (const v of ["legacy", "ring"]) for (const [label, re] of [["claimBySig A", /^claimBySig A/], ["claimBySig B", /^claimBySig B/], ["sponsored claimSelf D", /^sponsored/], ["refund C", /^refund C/]]) if (!find(v, "reuse", re)) missing.push(`${v} ${label}`);
+    for (const v of ["legacy", "ring"]) for (const [label, re] of [["claimBySig A", /^claimBySig A/], ["claimBySig B", /^claimBySig B/], ["sponsored claimSelf D", /^sponsored/], ...(v === "legacy" ? [["refund C", /^refund C/]] : [])]) if (!find(v, "reuse", re)) missing.push(`${v} ${label}`);
     if (missing.length) L.push(`- Round-reuse receipts not taken: ${missing.join(", ")}. Their round-first counterparts stand in above.`);
     for (const note of rep.notes ?? []) L.push(`- ${note}`);
     L.push("");
   }
 
   L.push("## Every receipt", "");
-  L.push("- What the table shows: every measured transaction of this run: vault, round, shape, ring index (ring vault only), the recipient's token balance in the parent block where a transfer happened (the evidence for cold / warm), `gasUsed`, the EntryPoint's `actualGasUsed` for the sponsored exits, the block, and a dora link. Every lock receipt was checked for its `Locked` event (swap id, claimant, amount, expiry and, on the ring, the index) and every claim or refund receipt for its `Redeemed` / `Refunded` event; a mismatch would have aborted the run. State reads are not used as evidence: the public RPC load-balances over nodes that answer a pinned block with stale or empty state.", "");
+  L.push("- What the table shows: every measured transaction of this run: vault, round, shape, ring index (ring vault only), the recipient's token balance in the parent block where a transfer happened (the evidence for cold / warm), `gasUsed`, the EntryPoint's `actualGasUsed` for the sponsored exits, the block, and the transaction hash (a dora link on the devnet). Every lock receipt was checked for its `Locked` event (swap id, claimant, amount, the expiry on the legacy vault and the index on the ring) and every claim or refund receipt for its `Redeemed` / `Refunded` event; a mismatch would have aborted the run. State reads are not used as evidence: on the devnet the public RPC load-balances over nodes that answer a pinned block with stale or empty state, and the local run keeps the same rule.", "");
   L.push("| # | Vault | Round | Shape | idx | Recipient balance before | gasUsed | actualGasUsed | Block | Tx |", "|---:|---|---|---|---:|---:|---:|---:|---:|---|");
   rep.receipts.forEach((r, i) => L.push(`| ${i + 1} | ${r.vault} | ${r.round} | ${r.shape}${r.recipientStateVerified === undefined || r.recipientStateVerified === true ? "" : ` (${r.recipientStateVerified})`} | ${r.idx ?? "–"} | ${r.recipientBalanceBefore === undefined ? "–" : (r.recipientBalanceBefore ?? "n/a")} | **${fmt(r.gasUsed)}** | ${r.actualGasUsed ? fmt(r.actualGasUsed) : "–"} | ${blk(r.confirmationBlock)} | ${short(r.transactionHash)} |`));
   L.push("");
@@ -496,6 +511,6 @@ function renderMd(rep) {
   L.push("## Fidelity", "");
   const f = rep.fidelity.usdt;
   L.push(`- USDT: ${addr(f.devnet)} carries mainnet \`${f.mainnet}\`'s runtime (${f.runtimeBytes} bytes, keccak \`${f.codeHash}\`; compared against mainnet \`eth_getCode\` in this run: ${f.codeHashEqualsMainnet}), not proxied, like mainnet. \`paused\` / \`deprecated\` / \`basisPointsRate\` / \`maximumFee\` read ${f.stateParity.paused} / ${f.stateParity.deprecated} / ${f.stateParity.basisPointsRate} / ${f.stateParity.maximumFee}.`);
-  L.push(`- Both vaults were deployed by this run from this repo's \`forge build\` (solc 0.8.28, optimizer 200, evm prague) with the same \`Config\` (exit envelope ${fmt(rep.caps.envelope)} gas, sponsored fee ceiling ${Number(rep.caps.maxSponsoredFeePerGas) / 1e9} gwei, \`EMERGENCY_EXIT_COST\` ${formatEther(BigInt(rep.caps.emergencyExitCost))} ETH). The legacy source is bridge-vault's \`contracts/MuunUSDTVault.sol\` byte for byte.`, "");
+  L.push(`- Both vaults were deployed by this run from this repo's \`forge build\` (solc 0.8.28, optimizer 200, evm prague) with the same \`Config\` (the ring adds its two stake floors; exit envelope ${fmt(rep.caps.envelope)} gas, sponsored fee ceiling ${Number(rep.caps.maxSponsoredFeePerGas) / 1e9} gwei, \`EMERGENCY_EXIT_COST\` ${formatEther(BigInt(rep.caps.emergencyExitCost))} ETH). The legacy source is bridge-vault's \`contracts/MuunUSDTVault.sol\` byte for byte.`, "");
   return `${L.join("\n")}\n`;
 }

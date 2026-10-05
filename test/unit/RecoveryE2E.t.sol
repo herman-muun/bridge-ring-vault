@@ -28,9 +28,8 @@ contract MaliciousDelegate {
 }
 
 contract RecoveryE2ETest is VaultTestBase {
-    bytes32 internal constant USER_OP_EVENT = keccak256(
-        "UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)"
-    );
+    bytes32 internal constant USER_OP_EVENT =
+        keccak256("UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)");
 
     function setUp() public override {
         super.setUp();
@@ -57,15 +56,14 @@ contract RecoveryE2ETest is VaultTestBase {
 
     function test_zeroEthClaimantExitsAndTheDepositPaysForIt() public {
         bytes32 swapId = bytes32("a");
-        uint48 expiry = _defaultExpiry();
-        _lock(swapId, expiry);
+        _lock(swapId);
 
         vm.deal(claimant, 0);
         uint256 depositBefore = vault.sponsorshipDeposit();
         uint256 beneficiaryBefore = bundler.balance;
 
         vm.recordLogs();
-        _handleOps(_sign(_op(swapId, expiry), claimantKey));
+        _handleOps(_sign(_op(swapId), claimantKey));
         (bool success, uint256 actualGasCost,) = _lastUserOp();
 
         assertTrue(success, "user operation succeeded");
@@ -74,30 +72,50 @@ contract RecoveryE2ETest is VaultTestBase {
         assertEq(vault.inFlight(), 0, "counter released");
         assertEq(vault.reserved(), 0);
         assertEq(vault.ring(idxOf(swapId)), vault.CONSUMED(), "reservation consumed");
-        assertEq(
-            depositBefore - vault.sponsorshipDeposit(), actualGasCost, "deposit paid exactly"
-        );
+        assertEq(depositBefore - vault.sponsorshipDeposit(), actualGasCost, "deposit paid exactly");
         assertEq(bundler.balance - beneficiaryBefore, actualGasCost, "bundler reimbursed");
         assertLe(actualGasCost, COST, "never more than one budget");
     }
 
-    function test_exitAfterExpiryIsRejected() public {
+    /// R2: the sponsored exit has no time bound. Years later it still works.
+    function test_exitYearsLaterStillSponsored() public {
         bytes32 swapId = bytes32("a");
-        uint48 expiry = _defaultExpiry();
-        _lock(swapId, expiry);
+        _lock(swapId);
 
-        PackedUserOperation memory op = _sign(_op(swapId, expiry), claimantKey);
-        vm.warp(uint256(expiry) + 1);
+        vm.warp(block.timestamp + 10 * 365 days);
+        vm.deal(claimant, 0);
 
+        vm.recordLogs();
+        _handleOps(_sign(_op(swapId), claimantKey));
+        (bool success,,) = _lastUserOp();
+
+        assertTrue(success, "no time bound anywhere");
+        assertEq(token.balanceOf(recipient), AMOUNT);
+        assertEq(vault.ring(idxOf(swapId)), vault.CONSUMED());
+    }
+
+    /// Without `validUntil`, a sponsored op that outlives its reservation (claimed by signature
+    /// meanwhile) is declined by the paymaster at no cost to the deposit.
+    function test_sponsoredOpAfterClaimBySigIsDeclined() public {
+        bytes32 swapId = bytes32("a");
+        _lock(swapId);
+        PackedUserOperation memory op = _sign(_op(swapId), claimantKey);
+
+        bytes32 digest = vault.claimDigest(swapId, AMOUNT, recipient);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(claimantKey, digest);
+        vault.claimBySig(swapId, AMOUNT, recipient, abi.encodePacked(r, s, v), idxOf(swapId));
+
+        uint256 depositBefore = vault.sponsorshipDeposit();
+        assertEq(vault.sponsorshipRejection(op, COST), vault.REJECT_RESERVATION());
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
         ops[0] = op;
         vm.prank(bundler, bundler);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                IEntryPoint.FailedOp.selector, 0, "AA32 paymaster expired or not due"
-            )
+            abi.encodeWithSelector(IEntryPoint.FailedOp.selector, 0, "AA34 signature error")
         );
         entryPoint.handleOps(ops, payable(bundler));
+        assertEq(vault.sponsorshipDeposit(), depositBefore, "deposit untouched");
+        assertEq(token.balanceOf(recipient), AMOUNT, "paid once, by the signature");
     }
 
     // --- the delegate pin ---------------------------------------------------------------------
@@ -106,14 +124,13 @@ contract RecoveryE2ETest is VaultTestBase {
     /// reservation. With it, such an operation never reaches execution and costs the deposit zero.
     function test_maliciousDelegateIsRejectedAndCostsNothing() public {
         bytes32 swapId = bytes32("a");
-        uint48 expiry = _defaultExpiry();
-        _lock(swapId, expiry);
+        _lock(swapId);
 
         MaliciousDelegate evil = new MaliciousDelegate();
         vm.signAndAttachDelegation(address(evil), claimantKey);
 
         uint256 depositBefore = vault.sponsorshipDeposit();
-        PackedUserOperation memory op = _sign(_op(swapId, expiry), claimantKey);
+        PackedUserOperation memory op = _sign(_op(swapId), claimantKey);
 
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
         ops[0] = op;
@@ -134,12 +151,11 @@ contract RecoveryE2ETest is VaultTestBase {
     /// only sponsored attempt this claimant gets.
     function test_burnedAttemptIsBoundedAndNotRepeatable() public {
         bytes32 swapId = bytes32("a");
-        uint48 expiry = _defaultExpiry();
-        _lock(swapId, expiry);
+        _lock(swapId);
 
         uint256 depositBefore = vault.sponsorshipDeposit();
 
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.accountGasLimits = _pack(VGL_CAP, 25_000); // too little to finish the transfer
         vm.recordLogs();
         _handleOps(_sign(op, claimantKey));
@@ -154,7 +170,7 @@ contract RecoveryE2ETest is VaultTestBase {
         // No second sponsored attempt is reachable, and the two ways of trying fail differently.
         // Replaying nonce 0 is rejected by the EntryPoint, whose sequence has advanced.
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);
-        ops[0] = _sign(_op(swapId, expiry), claimantKey);
+        ops[0] = _sign(_op(swapId), claimantKey);
         vm.prank(bundler, bundler);
         vm.expectRevert(
             abi.encodeWithSelector(IEntryPoint.FailedOp.selector, 0, "AA25 invalid account nonce")
@@ -162,7 +178,7 @@ contract RecoveryE2ETest is VaultTestBase {
         entryPoint.handleOps(ops, payable(bundler));
 
         // Using the sequence the EntryPoint would now accept is declined by the paymaster.
-        PackedUserOperation memory next = _op(swapId, expiry);
+        PackedUserOperation memory next = _op(swapId);
         next.nonce = 1;
         assertEq(vault.sponsorshipRejection(next, COST), vault.REJECT_NONCE());
         ops[0] = _sign(next, claimantKey);
@@ -180,28 +196,27 @@ contract RecoveryE2ETest is VaultTestBase {
         (address other, uint256 otherKey) = makeAddrAndKey("claimantQ");
         vm.signAndAttachDelegation(address(accountImpl), otherKey);
 
-        uint48 expiry = _defaultExpiry();
         bytes32 swapA = bytes32("a");
         bytes32 swapB = bytes32("b");
 
         vm.startPrank(owner);
-        vault.lock(swapA, claimant, AMOUNT, expiry, idxOf(swapA));
-        vault.lock(swapB, other, AMOUNT, expiry, idxOf(swapB));
+        vault.lock(swapA, claimant, AMOUNT, idxOf(swapA));
+        vault.lock(swapB, other, AMOUNT, idxOf(swapB));
         vm.stopPrank();
 
         assertGe(vault.sponsorshipDeposit(), 2 * COST);
 
         // A burns its attempt.
-        PackedUserOperation memory bad = _op(swapA, expiry);
+        PackedUserOperation memory bad = _op(swapA);
         bad.accountGasLimits = _pack(VGL_CAP, 25_000);
         _handleOps(_sign(bad, claimantKey));
         assertEq(token.balanceOf(recipient), 0);
 
         // B still has a full budget and exits normally.
         address recipientB = address(0xB0B);
-        PackedUserOperation memory good = _op(swapB, expiry);
+        PackedUserOperation memory good = _op(swapB);
         good.sender = other;
-        good.callData = _exitCallData(swapB, AMOUNT, recipientB, expiry);
+        good.callData = _exitCallData(swapB, AMOUNT, recipientB);
         vm.deal(other, 0);
 
         vm.recordLogs();
@@ -220,12 +235,11 @@ contract RecoveryE2ETest is VaultTestBase {
     /// honest and successful exit, must not be able to convert the budget into profit.
     function test_selfBundlerCannotExtractTheBudget() public {
         bytes32 swapId = bytes32("a");
-        uint48 expiry = _defaultExpiry();
-        _lock(swapId, expiry);
+        _lock(swapId);
 
         uint256 depositBefore = vault.sponsorshipDeposit();
 
-        PackedUserOperation memory op = _op(swapId, expiry);
+        PackedUserOperation memory op = _op(swapId);
         op.preVerificationGas = PVG_CAP;
         op.gasFees = _pack(PRIORITY_CAP, MAX_FEE);
         assertLe(_maxCost(op), COST, "the caps keep the prefund inside one budget");

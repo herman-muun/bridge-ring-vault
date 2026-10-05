@@ -18,7 +18,6 @@ contract VaultHandler is Test {
         address claimant;
         uint256 key;
         uint256 amount;
-        uint48 expiry;
         bool live;
         bool sponsored; // its single sponsored attempt has been spent
     }
@@ -35,19 +34,17 @@ contract VaultHandler is Test {
     uint256 public ghostInFlight;
     uint256 private _salt;
 
-    constructor(
-        MuunRingVault v,
-        MockUSDT t,
-        EntryPoint e,
-        Simple7702Account a,
-        address o
-    ) {
+    constructor(MuunRingVault v, MockUSDT t, EntryPoint e, Simple7702Account a, address o) {
         vault = v;
         token = t;
         entryPoint = e;
         accountImpl = a;
         owner = o;
         vm.deal(bundler, 1000 ether);
+    }
+
+    function swapCount() external view returns (uint256) {
+        return swaps.length;
     }
 
     /// Reservations that still hold an unspent sponsorship budget.
@@ -59,17 +56,16 @@ contract VaultHandler is Test {
 
     // --- actions ----------------------------------------------------------------------------
 
-    function lock(uint256 amountSeed, uint256 ttlSeed) external {
-        uint256 amount = bound(amountSeed, 1, 1_000e6);
-        uint48 expiry = uint48(block.timestamp + bound(ttlSeed, 1, 30 days));
+    function lock(uint256 amountSeed) external {
+        uint256 amount = bound(amountSeed, 1, 1000e6);
         bytes32 id = keccak256(abi.encode("swap", _salt));
         (address p, uint256 key) = makeAddrAndKey(string.concat("P", vm.toString(_salt)));
         _salt++;
 
         vm.prank(owner);
-        try vault.lock(id, p, amount, expiry, idxOf(id)) {
+        try vault.lock(id, p, amount, idxOf(id)) {
             vm.signAndAttachDelegation(address(accountImpl), key);
-            swaps.push(Swap(id, p, key, amount, expiry, true, false));
+            swaps.push(Swap(id, p, key, amount, true, false));
             ghostReserved += amount;
             ghostInFlight += 1;
         } catch { }
@@ -90,14 +86,13 @@ contract VaultHandler is Test {
             address(vault),
             uint256(0),
             abi.encodeCall(
-                MuunRingVault.claimSelf, (sw.id, sw.amount, address(0xD00D), sw.expiry, idxOf(sw.id))
+                MuunRingVault.claimSelf, (sw.id, sw.amount, address(0xD00D), idxOf(sw.id))
             )
         );
         op.accountGasLimits = bytes32((uint256(250_000) << 128) | (starve ? 25_000 : 250_000));
         op.preVerificationGas = 100_000;
         op.gasFees = bytes32((uint256(1 gwei) << 128) | uint256(10 gwei));
-        op.paymasterAndData =
-            abi.encodePacked(address(vault), uint128(100_000), uint128(0));
+        op.paymasterAndData = abi.encodePacked(address(vault), uint128(100_000), uint128(0));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(sw.key, entryPoint.getUserOpHash(op));
         op.signature = abi.encodePacked(r, s, v);
 
@@ -121,17 +116,7 @@ contract VaultHandler is Test {
         Swap storage sw = swaps[i];
 
         vm.prank(sw.claimant);
-        try vault.claimSelf(sw.id, sw.amount, address(0xD00D), sw.expiry, idxOf(sw.id)) {
-            _release(i);
-        } catch { }
-    }
-
-    function refundExpired(uint256 idxSeed) external {
-        uint256 i = _pick(idxSeed);
-        if (i == type(uint256).max) return;
-        Swap storage sw = swaps[i];
-
-        try vault.refund(sw.id, sw.claimant, sw.amount, sw.expiry, idxOf(sw.id)) {
+        try vault.claimSelf(sw.id, sw.amount, address(0xD00D), idxOf(sw.id)) {
             _release(i);
         } catch { }
     }
@@ -151,6 +136,8 @@ contract VaultHandler is Test {
         try vault.withdrawETH(payable(owner), amount, fromDeposit) { } catch { }
     }
 
+    /// R2: time passing is a no-op for the ring and the counters. Kept so the fuzzer interleaves
+    /// long waits with everything else.
     function warp(uint256 dtSeed) external {
         vm.warp(block.timestamp + bound(dtSeed, 1, 10 days));
     }
@@ -182,9 +169,9 @@ contract VaultInvariantTest is StdInvariant, VaultTestBase {
 
     /// Guards against the invariant becoming a restatement of `deposit >= inFlight * COST`.
     /// A starved sponsored exit spends the budget without consuming the reservation, so the two
-    /// counts must be able to diverge — and the deposit must fall while `inFlight` holds.
+    /// counts must be able to diverge, and the deposit must fall while `inFlight` holds.
     function test_handlerActuallyDrivesTheSponsoredPath() public {
-        handler.lock(1, 1);
+        handler.lock(1);
         assertEq(handler.ghostInFlight(), 1, "handler locked");
         assertEq(handler.ghostUnsponsored(), 1);
 
@@ -199,7 +186,7 @@ contract VaultInvariantTest is StdInvariant, VaultTestBase {
 
     /// And the succeeding variant consumes the reservation outright.
     function test_handlerSponsoredExitCanSucceed() public {
-        handler.lock(2, 2);
+        handler.lock(2);
         uint256 before = vault.sponsorshipDeposit();
         handler.sponsoredExit(0, false);
 
@@ -233,5 +220,17 @@ contract VaultInvariantTest is StdInvariant, VaultTestBase {
     /// forge-config: default.invariant.depth = 40
     function invariant_usdtCoversReservations() public view {
         assertGe(token.balanceOf(address(vault)), vault.reserved());
+    }
+
+    /// R2 as an invariant: every reservation the handler still counts as live is in the ring
+    /// exactly as locked, however much time the handler has warped.
+    /// forge-config: default.invariant.runs = 32
+    /// forge-config: default.invariant.depth = 40
+    function invariant_liveReservationsNeverExpire() public view {
+        uint256 n = handler.swapCount();
+        for (uint256 i = 0; i < n; i++) {
+            (bytes32 id, address p,, uint256 amount, bool live,) = handler.swaps(i);
+            if (live) assertTrue(vault.isReservation(id, p, amount, idxOf(id)), "still there");
+        }
     }
 }

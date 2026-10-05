@@ -2,7 +2,10 @@
 
 ## Hardening pass (plan, 2026-10-02)
 
-Status: plan. Source: `hardening-exploration/REPORT.md` §1.4 (E1, E5b, E9), §2.3, §2.6, and
+Status: done 2026-10-02, reviewed by a second agent the same day (no critical, high or medium
+findings; its low and nit items are applied). Contract, 86 tests (74 before), `reports/local-vault-2026-10.{json,md}`
+on the local Glamsterdam node, `docs/decisions.md` #7 to #11, `docs/design.md`, `README.md`.
+Source: `hardening-exploration/REPORT.md` §1.4 (E1, E5b, E9), §2.3, §2.6, and
 `research/ring-entry-comparison.md`. Decisions taken by Herman on 2026-10-01 and 2026-10-02.
 The claim tip (`bridge-vault/LAST_LEG.md`, "Possible improvement") stays out of this pass.
 
@@ -56,7 +59,7 @@ withdraw gating, ETH and stake functions, gas caps, the delegate check, `sponsor
 
 | file | remove | add |
 | --- | --- | --- |
-| `Ring.t.sol` | R2 (inline release), every `warp` past expiry, `refund` cases | R1: `lock` over a live entry reverts whatever the time; R2': a reservation is claimable after a `warp` of years; R7: entry equals the raw keccak and no 64-bit truncation of `amount` matches another amount |
+| `Ring.t.sol` | R2 (inline release), every `warp` past expiry, `refund` cases | R1: `lock` over a live entry reverts whatever the time, the entry equals the raw keccak and no 64-bit truncation of `amount` matches another amount; R2: a reservation is claimable after a `warp` of years |
 | `PaymasterValidation.t.sol` | the `expiry` word tests | the 292-byte shape; the old 324-byte shape is `REJECT_CALLDATA`; `validationData` carries no `validUntil` |
 | `SponsorshipFunding.t.sol` | `addStake(1)` as a valid setup | `lock` reverts `StakeTooLow` and `UnstakeDelayTooShort`; the floor values pass |
 | `Invariant.t.sol` | the expired-entry term | `reserved == sum of unconsumed entries`, `inFlight == count of unconsumed entries`, for ever |
@@ -65,15 +68,16 @@ withdraw gating, ETH and stake functions, gas caps, the delegate check, `sponsor
 
 ### 3. Measurement and docs
 
-1. `scripts/measure-glamsterdam-vault.mjs` and `scripts/lib/userop.mjs`: drop `expiry` from
+1. `scripts/measure-glamsterdam-vault.mjs` (the userOp builder lives in it): drop `expiry` from
    the calls and the userOp, drop the "wait for expiry" and the `refund` step, keep the two
    rounds (`first`, `reuse`) with the reuse round driven by claims only.
 2. Run against the local Glamsterdam node (`glamsterdam-local`, chain id 70910475) and write
    `reports/local-vault-2026-10.{json,md}` next to the existing reports. Expected `[ESTIMATE]`:
    `lock` within a few hundred gas of today's 62,504 on reuse (one fewer range check, one more
-   comparison on the stake), `claimBySig` unchanged.
+   comparison on the stake), `claimBySig` unchanged. Measured: `lock` 61,889 on reuse (−705
+   against the previous layout on the same node), `claimBySig` 93,524 (−425).
 3. `docs/decisions.md`: #7 no expiry and no refund (2026-10-01), #8 256-bit entry, #9 stake
-   minimums, #10 claim tip deferred; mark #2 and #4 as replaced. `docs/design.md` §1 to §3 and
+   minimums, #10 claim tip deferred, #11 domain version "3"; #2 and #4 marked as replaced. `docs/design.md` §1 to §3 and
    `README.md` updated after the receipts. `hardening-exploration/REPORT.md` §2.3 and §2.6 move
    from "decided" to "implemented".
 
@@ -237,7 +241,7 @@ Accounts (env names only, never values): `GLAMSTERDAM_RPC_URL`, `GLAMSTERDAM_PRI
 | 2 | `contracts/legacy/MuunUSDTVault.sol`, `contracts/MockUSDT.sol` | bridge-vault, verbatim |
 | 3 | `contracts/MuunRingVault.sol` | new, section 2 |
 | 4 | `test/` (four files adapted) + `test/unit/Ring.t.sol` | bridge-vault tests + R1..R6 |
-| 5 | `scripts/lib/common.mjs` (retrying sends, 503 handling), `scripts/measure-glamsterdam-vault.mjs`, `scripts/lib/userop.mjs` (the 7702 + 4337 op builder) | ring repo's measure script, bridge-vault's `recovery-path.mjs` |
+| 5 | `scripts/lib/common.mjs` (retrying sends, 503 handling), `scripts/measure-glamsterdam-vault.mjs`, the 7702 + 4337 op builder (folded into the measure script, no separate `userop.mjs`) | ring repo's measure script, bridge-vault's `recovery-path.mjs` |
 | 6 | `npm run measure:glam`, `reports/glamsterdam-vault.{json,md}` | the run |
 | 7 | `README.md`, `docs/design.md`, `docs/decisions.md` | after the receipts |
 
