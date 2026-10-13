@@ -1,0 +1,16 @@
+# Separate profile: TVM targets must not inherit the Ethereum profile's Prague
+# EVM version or 0.8.28 solc, neither of which TRON's compiler tracks.
+[profile.default]
+src = "contracts"
+test = "test"
+out = "out"
+cache_path = "cache"
+solc_version = "0.8.24"
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+cbor_metadata = false
+# OpenZeppelin and forge-std are shared with the Ethereum build at the repo root.
+allow_paths = ["../node_modules"]
+libs = ["../node_modules"]
